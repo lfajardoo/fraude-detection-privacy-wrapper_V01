@@ -1,0 +1,35 @@
+version: '3.9'
+
+services:
+  # API del modelo
+  modelo-financiero:
+    build:
+      context: ./modelo-python
+      dockerfile: Dockerfile
+    container_name: modelo-fraude-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    networks:
+      - Test1
+
+  # API del privacy engineering
+  privacy-api:
+    build:
+      context: ./privacy-api
+      dockerfile: Dockerfile
+    container_name: privacy-api
+    ports:
+      - "8001:8001"
+    depends_on:
+      - modelo-financiero
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - MODEL_API_BASE_URL=http://modelo-financiero:8000
+    command: python app.py
+    networks:
+      - Test1
+
+networks:
+  Test1:
+    driver: bridge      
