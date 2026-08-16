@@ -1,7 +1,7 @@
 # Bitácora de Evolución de Arquitectura - Privacy API
 
 **Proyecto:** Sistema de Detección de Fraude con Privacy Engineering  
-**Última actualización:** 2026-08-02
+**Última actualización:** 2026-08-15
 
 ---
 
@@ -9,11 +9,12 @@
 
 1. [Visión General](#visión-general)
 2. [Arquitectura Actual (Fase 1)](#arquitectura-actual-fase-1)
-3. [Propuesta: Árbol de Decisión (Fase 2)](#propuesta-árbol-de-decisión-fase-2)
-4. [Evaluación del Diseño](#evaluación-del-diseño)
-5. [Roadmap de Evolución](#roadmap-de-evolución)
-6. [Implementación Técnica](#implementación-técnica)
-7. [Notas de Desarrollo](#notas-de-desarrollo)
+3. [Métricas de Evaluación (Fase 1.5 — implementada)](#métricas-de-evaluación-fase-15--implementada)
+4. [Propuesta: Árbol de Decisión (Fase 2)](#propuesta-árbol-de-decisión-fase-2)
+5. [Evaluación del Diseño](#evaluación-del-diseño)
+6. [Roadmap de Evolución](#roadmap-de-evolución)
+7. [Implementación Técnica](#implementación-técnica)
+8. [Notas de Desarrollo](#notas-de-desarrollo)
 
 ---
 
@@ -108,6 +109,107 @@ for i in range(repetitions):
 - ❌ Mismo nivel de ruido para todas las situaciones
 - ❌ No aprende de datos históricos
 - ✅ Funcional, simple, predecible
+
+---
+
+## Métricas de Evaluación (Fase 1.5 — implementada)
+
+**Fecha:** 2026-08-15  
+**Versión:** 1.5
+
+### Motivación
+
+Antes de diseñar la gobernanza dinámica (Fase 2) se necesita un marco de
+evaluación que responda cuantitativamente: ¿cuánta utilidad pierde el sistema
+al añadir ruido DP? ¿cuántos fraudes reales quedan sin detectar? ¿el ruido es
+independiente del nivel de riesgo?
+
+### Base Teórica
+
+| Dimensión | Métrica(s) | Referencia |
+|---|---|---|
+| Comportamiento del ruido | MAE, RMSE, ratio RMSE/MAE | Chai & Draxler, GMD 2014 |
+| Utilidad (clasificación) | Accuracy, F1 | Powers 2011; Fawcett 2006 |
+| Utilidad (libre de sesgo) | Informedness (BM), MCC | Powers 2011 |
+| Sensibilidad | FNR (fraudes que escapan) | Fawcett 2006 |
+| Tradeoff privacidad-utilidad | Utility Retention, Risk-Noise Correlation | Geng et al., AISTATS 2020 |
+| Adaptatividad (Fase 2 prep) | Monotonicity constraint | Kotłowski & Słowiński, TKDE 2013 |
+
+### Estructura de Archivos Añadidos
+
+```
+privacy-api/
+├── metrics/
+│   ├── __init__.py               # re-exports limpios de todo el paquete
+│   ├── noise_metrics.py          # mae(), rmse(), noise_summary()
+│   ├── classification_metrics.py # accuracy(), fnr(), f1(),
+│   │                             #   informedness(), markedness(), mcc(),
+│   │                             #   classification_report()
+│   └── privacy_metrics.py        # utility_retention(),
+│                                 #   risk_noise_correlation(),
+│                                 #   privacy_utility_summary()
+└── evaluator.py                  # BatchEvaluator — orquesta métricas
+```
+
+### Nuevo Endpoint: `POST /evaluate`
+
+Recibe una lista de transacciones etiquetadas con ground-truth y devuelve un
+informe completo de métricas. Límite: `EVALUATION_MAX_TRANSACTIONS` (config).
+
+**Request:**
+```json
+{
+  "transactions": [
+    { "Time": 0, "V1": -1.35, ..., "Amount": 149.62, "label": 1 }
+  ],
+  "mode": "governed",
+  "threshold": 0.5
+}
+```
+
+**Response (estructura):**
+```json
+{
+  "n_transactions": 100,
+  "noise_metrics": {
+    "fraud_probability": { "mae": 0.12, "rmse": 0.18, "rmse_mae_ratio": 1.5, "n_samples": 100 }
+  },
+  "classification_original": {
+    "accuracy": 0.97, "fnr": 0.04, "f1": 0.83,
+    "informedness": 0.76, "markedness": 0.71, "mcc": 0.73
+  },
+  "classification_with_dp": { "..." },
+  "utility_retention": {
+    "accuracy": 0.98, "f1": 0.91, "informedness": 0.88, "mcc": 0.89
+  },
+  "privacy_utility": {
+    "utility_retention": 0.91, "risk_noise_correlation": 0.03
+  }
+}
+```
+
+### Contrato de Monotonía (Fase 2 — governor.py)
+
+`governor.py` expone:
+- `MONOTONE_EPSILON_SCHEDULE`: mapeo canónico riesgo → ε (decreasing)
+- `validate_monotone_schedule(schedule)`: verifica invariante en tiempo de carga
+- `epsilon_from_risk(fraud_probability)`: lookup monotóno listo para Fase 2
+
+La Fase 2 reemplazará la lógica hardcodeada de `decide()` por un regresor
+isotónico entrenado sobre datos, pero debe continuar pasando
+`validate_monotone_schedule` para garantizar la propiedad teórica
+[Kotłowski & Słowiński §3].
+
+### Principios de Extensibilidad
+
+- **Añadir una métrica nueva:** añadir función en el módulo correspondiente
+  de `metrics/` y re-exportar desde `metrics/__init__.py`. No tocar `app.py`.
+- **Añadir un modelo nuevo:** crear nuevo `client_*.py` siguiendo el contrato
+  de `ModelAPIClient`; `evaluator.py` acepta cualquier cliente que implemente
+  `.predict(features) → dict`.
+- **Añadir una dimensión nueva** (p. ej. equidad/fairness): crear
+  `metrics/fairness_metrics.py` con sus funciones y añadir la sección
+  correspondiente en `evaluator.py`.
 
 ---
 

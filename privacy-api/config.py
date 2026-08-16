@@ -50,3 +50,9 @@ CACHE_TTL_SECONDS = 300
 # Aplicar privacidad diferencial también a is_fraud (clasificación binaria)?
 APPLY_DP_TO_CLASSIFICATION = False
 
+# ===== CONFIGURACIÓN DE EVALUACIÓN POR LOTES =====
+# Umbral para binarizar fraud_probability → is_fraud en la evaluación
+EVALUATION_THRESHOLD = 0.5
+# Número máximo de transacciones por request de evaluación (protección DoS)
+EVALUATION_MAX_TRANSACTIONS = 1000
+

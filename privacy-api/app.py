@@ -16,7 +16,9 @@ from client import model_client
 from privacy_layer import dp_layer
 from governor import GovernanceDecision, governor
 from privacy_governor_simple import gobernar_politica
-from config import PRIVACY_API_HOST, PRIVACY_API_PORT, LOG_LEVEL
+from evaluator import batch_evaluator
+from metrics import noise_summary
+from config import PRIVACY_API_HOST, PRIVACY_API_PORT, LOG_LEVEL, EVALUATION_MAX_TRANSACTIONS, EVALUATION_THRESHOLD
 
 # Configurar logging
 logging.basicConfig(level=LOG_LEVEL)
@@ -101,11 +103,38 @@ class NoiseRepetitionResult(BaseModel):
         legacy: Optional[PredictionValues] = Field(None, description="Predicción con epsilon legacy")
         governed: Optional[PredictionValues] = Field(None, description="Predicción con política del governor simple")
 
+class NoiseSummary(BaseModel):
+   """MAE, RMSE and noise statistics for a single field across N repetitions."""
+   mae: float = Field(..., description="Mean Absolute Error (original vs noisy)")
+   rmse: float = Field(..., description="Root Mean Square Error (original vs noisy)")
+   rmse_mae_ratio: Optional[float] = Field(
+       None,
+       description="RMSE/MAE ratio — >1 indicates large noise spikes. None with n_samples<2 or mae=0."
+   )
+   noise_std: Optional[float] = Field(
+       None,
+       description="Std dev of |noise| across repetitions. None with n_samples<2. "
+                   "High value = unstable DP output across calls."
+   )
+   n_samples: int = Field(..., description="Number of DP repetitions used")
+
+class RequestMetrics(BaseModel):
+   """Per-request noise metrics computed across all noise_repetitions."""
+   fraud_probability: NoiseSummary = Field(..., description="Noise metrics for fraud_probability")
+   confidence_score: NoiseSummary = Field(..., description="Noise metrics for confidence_score")
+   flip_rate: float = Field(
+       ...,
+       description="Fraction of repetitions where DP noise flipped is_fraud vs original. "
+                   "Meaningful with noise_repetitions>=2."
+   )
+   flip_count: int = Field(..., description="Number of repetitions where is_fraud changed due to DP noise")
+
 class MultiPredictionResponse(BaseModel):
    """Respuesta con N repeticiones independientes de ruido DP."""
    noise_repetitions: int = Field(..., description="Número de repeticiones ejecutadas")
    original: Optional[OriginalValues] = Field(None, description="Valores originales del modelo (sin ruido)")
    results: List[NoiseRepetitionResult] = Field(..., description="Una respuesta por cada repetición")
+   metrics: Optional[RequestMetrics] = Field(None, description="Noise metrics across all repetitions (None when mode=raw)")
 
 
 def _prediction_values(response: Dict[str, Any]) -> Dict[str, Any]:
@@ -146,6 +175,7 @@ def root():
             "predict": "/predict (POST)",
             "predict-laplace": "/predict-laplace (POST)",
             "predict-gaussian": "/predict-gaussian (POST)",
+            "evaluate": "/evaluate (POST)",
         }
     }
 
@@ -206,6 +236,9 @@ def predict_with_dp(
 
         results = []
         original_obj = None
+        noise_pairs_prob: list = []
+        noise_pairs_conf: list = []
+        flip_count: int = 0
 
         for i in range(repetitions):
             raw_result = model_prediction.copy()
@@ -252,12 +285,25 @@ def predict_with_dp(
                     confidence_score_original=model_prediction.get("confidence_score"),
                 )
 
+            orig_prob = float(model_prediction["fraud_probability"])
+            orig_conf = float(model_prediction["confidence_score"])
+            orig_is_fraud = int(model_prediction["is_fraud"])
+            noisy_prob = float(result_with_dp.get("fraud_probability"))
+            noisy_conf = float(result_with_dp.get("confidence_score"))
+            # Derive is_fraud from the noisy probability (the DP-protected decision)
+            noisy_is_fraud = 1 if noisy_prob > 0.5 else 0
+            if selected_mode != "raw":
+                noise_pairs_prob.append((orig_prob, noisy_prob))
+                noise_pairs_conf.append((orig_conf, noisy_conf))
+                if noisy_is_fraud != orig_is_fraud:
+                    flip_count += 1
+
             result = NoiseRepetitionResult(
                 index=i + 1,
                 with_privacy=PredictionValues(
-                    is_fraud=int(result_with_dp.get("is_fraud")),
-                    fraud_probability=float(result_with_dp.get("fraud_probability")),
-                    confidence_score=float(result_with_dp.get("confidence_score")),
+                    is_fraud=noisy_is_fraud,
+                    fraud_probability=noisy_prob,
+                    confidence_score=noisy_conf,
                 ),
                 message=result_with_dp.get("message", ""),
                 privacy_info={
@@ -277,11 +323,24 @@ def predict_with_dp(
                 result.governed = PredictionValues(**_prediction_values(governed_result))
             results.append(result)
 
+        request_metrics = None
+        if noise_pairs_prob:
+            n_reps = len(noise_pairs_prob)
+            prob_summary = noise_summary(noise_pairs_prob)
+            conf_summary = noise_summary(noise_pairs_conf)
+            request_metrics = RequestMetrics(
+                fraud_probability=NoiseSummary(**prob_summary),
+                confidence_score=NoiseSummary(**conf_summary),
+                flip_count=flip_count,
+                flip_rate=flip_count / n_reps,
+            )
+
         logger.info(f"Predicción completada: {repetitions} repeticion(es) de ruido DP")
         return MultiPredictionResponse(
             noise_repetitions=repetitions,
             original=original_obj,
             results=results,
+            metrics=request_metrics,
         )
 
     except ConnectionError as e:
@@ -310,6 +369,85 @@ def predict_laplace(transaction: Transaction):
 def predict_gaussian(transaction: Transaction):
     """Alias: fuerza Gaussian sin modificar estado global."""
     return predict_with_dp(transaction, mechanism="gaussian")
+
+
+# ===== EVALUATION ENDPOINT =====
+
+class LabeledTransaction(BaseModel):
+    """Single transaction with ground-truth label for batch evaluation."""
+    Time: float
+    V1: float
+    V2: float
+    V3: float
+    V4: float
+    V5: float
+    V6: float
+    V7: float
+    V8: float
+    V9: float
+    V10: float
+    V11: float
+    V12: float
+    V13: float
+    V14: float
+    Amount: float
+    label: int = Field(..., ge=0, le=1, description="Ground-truth class: 0=legitimate, 1=fraud")
+
+
+class EvaluationRequest(BaseModel):
+    """Request body for POST /evaluate."""
+    transactions: List[LabeledTransaction] = Field(
+        ..., min_length=1, description="Labeled transactions for evaluation"
+    )
+    mode: str = Field("governed", description="DP mode: raw | legacy | governed")
+    threshold: float = Field(
+        EVALUATION_THRESHOLD, ge=0.0, le=1.0,
+        description="Probability threshold to binarise predictions"
+    )
+    mechanism: Optional[str] = Field(None, description="Override DP mechanism")
+
+
+@app.post("/evaluate")
+def evaluate(request: EvaluationRequest):
+    """
+    Batch evaluation: run all privacy-utility metrics over a labeled dataset.
+
+    Returns noise metrics (MAE, RMSE), classification metrics (Accuracy, FNR,
+    F1, Informedness, MCC), utility retention per metric, and risk-noise
+    correlation — for both the original model and the DP-protected output.
+    """
+    if len(request.transactions) > EVALUATION_MAX_TRANSACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many transactions: max {EVALUATION_MAX_TRANSACTIONS}, "
+                   f"got {len(request.transactions)}",
+        )
+
+    labeled = [t.model_dump() for t in request.transactions]
+
+    try:
+        report = batch_evaluator.evaluate(
+            labeled_transactions=labeled,
+            mode=request.mode,
+            threshold=request.threshold,
+            mechanism=request.mechanism,
+        )
+        return report
+
+    except ConnectionError as e:
+        logger.error(f"Error de conexión en evaluación: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Modelo-python no disponible. ¿Está ejecutándose?"
+        )
+
+    except (ValueError, RuntimeError) as e:
+        logger.error(f"Error de evaluación: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    except Exception as e:
+        logger.error(f"Error inesperado en evaluación: {e}")
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
 
 
 # ===== MAIN =====
