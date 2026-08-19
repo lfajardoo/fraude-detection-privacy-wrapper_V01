@@ -19,7 +19,7 @@ from governor import GovernanceDecision, governor
 from privacy_governor_simple import gobernar_politica
 from evaluator import batch_evaluator
 from metrics import noise_summary
-from config import PRIVACY_API_HOST, PRIVACY_API_PORT, LOG_LEVEL, EVALUATION_MAX_TRANSACTIONS, EVALUATION_THRESHOLD
+from config import PRIVACY_API_HOST, PRIVACY_API_PORT, LOG_LEVEL, EVALUATION_MAX_TRANSACTIONS, EVALUATION_THRESHOLD, EVALUATION_MODE
 
 # Configurar logging
 logging.basicConfig(level=LOG_LEVEL)
@@ -240,10 +240,13 @@ def predict_with_dp(
         # fraud_probability, que aún no está disponible antes del primer predict).
         input_decision = governor.decide(mechanism=mechanism)
         epsilon_in_input = getattr(input_decision, "epsilon_in", None) or input_decision.epsilon
-        perturbed_dict = input_dp_layer.apply(transaction_dict, epsilon_in=epsilon_in_input)
+        perturbed_dict, input_detail = input_dp_layer.apply_with_detail(transaction_dict, epsilon_in=epsilon_in_input)
+        _n_perturbed = len([f for f in FEATURE_BOUNDS if f in transaction_dict])
         input_privacy_info = {
             "mechanism": input_dp_layer.mechanism,
             "epsilon_in": epsilon_in_input,
+            "epsilon_in_total": epsilon_in_input,
+            "epsilon_per_feature": epsilon_in_input / _n_perturbed if _n_perturbed > 0 else 0.0,
             "features_perturbed": [f for f in FEATURE_BOUNDS if f in transaction_dict],
             "features_excluded": ["Time"],
         }
@@ -315,15 +318,7 @@ def predict_with_dp(
                 if noisy_is_fraud != orig_is_fraud:
                     flip_count += 1
 
-            result = NoiseRepetitionResult(
-                index=i + 1,
-                with_privacy=PredictionValues(
-                    is_fraud=noisy_is_fraud,
-                    fraud_probability=noisy_prob,
-                    confidence_score=noisy_conf,
-                ),
-                message=result_with_dp.get("message", ""),
-                privacy_info={
+            privacy_info_dict = {
                     "mode": selected_mode,
                     "mechanism": selected_decision.mechanism if selected_decision else None,
                     "epsilon": selected_decision.epsilon if selected_decision else 0.0,
@@ -333,7 +328,19 @@ def predict_with_dp(
                     "policy": governed_policy,
                     "review_required": governed_policy["politica"] == "P4",
                     "input_privacy": input_privacy_info,
-                },
+                }
+            if EVALUATION_MODE:
+                privacy_info_dict["input_perturbation_detail"] = input_detail
+
+            result = NoiseRepetitionResult(
+                index=i + 1,
+                with_privacy=PredictionValues(
+                    is_fraud=noisy_is_fraud,
+                    fraud_probability=noisy_prob,
+                    confidence_score=noisy_conf,
+                ),
+                message=result_with_dp.get("message", ""),
+                privacy_info=privacy_info_dict,
             )
             if compare_modes:
                 result.raw = PredictionValues(**_prediction_values(raw_result))

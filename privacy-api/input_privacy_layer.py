@@ -6,11 +6,15 @@ Capa de privacidad diferencial en la entrada (input-side DP).
     perturba las features de entrada ANTES de invocar al modelo, de forma que
     el modelo nunca recibe los valores originales en texto claro.
 
-(b) El presupuesto se aplica por feature de manera paralela: cada feature en
-    FEATURE_BOUNDS consume epsilon_in de forma independiente. Bajo composición
-    paralela (Theorem 2, Dwork & Roth 2014), el presupuesto total de la
-    consulta es epsilon_in (no epsilon_in × n_features), porque las features
-    se perturban sobre particiones disjuntas del dataset.
+(b) El presupuesto `epsilon_in` es el presupuesto **total de la consulta** y se
+    reparte uniformemente entre las features realmente perturbadas:
+    `epsilon_por_feature = epsilon_in / n_features_perturbadas`. Como todas las
+    features pertenecen al **mismo individuo** (la misma transacción), la
+    composición es **secuencial** (composición básica, Dwork & Roth 2014,
+    Theorems 3.14/3.16): la suma de los `epsilon_por_feature` es igual a
+    `epsilon_in`. NO es composición paralela: esta solo aplica cuando las
+    queries actúan sobre particiones disjuntas de individuos, lo que no ocurre
+    aquí (todas las features pertenecen al mismo registro).
 
 (c) Time está excluido intencionalmente: es un timestamp de la transacción,
     no una característica estadística del comportamiento del tarjetahabiente.
@@ -26,7 +30,7 @@ Capa de privacidad diferencial en la entrada (input-side DP).
 """
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -86,6 +90,72 @@ class InputPrivacyLayer:
             fn = np.random.laplace if self.mechanism == "laplace" else np.random.normal
         return float(fn(0.0, scale))
 
+    def apply_with_detail(
+        self,
+        features: dict,
+        epsilon_in: float,
+        delta: float = 1e-6,
+    ) -> Tuple[dict, List[dict]]:
+        """
+        Perturba las features con ruido DP calibrado y devuelve el dict
+        perturbado junto con una lista de detalle por feature.
+
+        El presupuesto `epsilon_in` se reparte uniformemente entre las features
+        presentes en FEATURE_BOUNDS: epsilon_por_feature = epsilon_in / n.
+        La suma de los epsilon_usado es igual a epsilon_in (composición secuencial).
+
+        Parameters
+        ----------
+        features : dict
+            Features de la transacción (puede incluir Time y otras claves).
+        epsilon_in : float
+            Presupuesto total. Si <= 0 no se aplica ruido.
+        delta : float
+            Probabilidad de fallo (solo relevante para mecanismo Gaussian).
+
+        Returns
+        -------
+        tuple[dict, list[dict]]
+            (dict_perturbado, detalle) donde detalle es una lista con un
+            elemento por feature perturbada::
+
+                {"feature", "original", "clipped", "perturbed", "epsilon_used"}
+        """
+        if epsilon_in <= 0.0:
+            return features.copy(), []
+
+        perturbables = [f for f in FEATURE_BOUNDS if f in features]
+        n = len(perturbables)
+        if n == 0:
+            return features.copy(), []
+
+        epsilon_per_feature = epsilon_in / n
+        result = features.copy()
+        detail: List[dict] = []
+
+        for feature in perturbables:
+            low, high = FEATURE_BOUNDS[feature]
+            sensitivity = high - low
+            if self.mechanism == "laplace":
+                scale = sensitivity / epsilon_per_feature
+            else:  # gaussian
+                scale = sensitivity * math.sqrt(2.0 * math.log(1.25 / delta)) / epsilon_per_feature
+
+            original = result[feature]
+            clipped = float(np.clip(original, low, high))
+            noisy = clipped + self._noise(scale)
+            perturbed = float(np.clip(noisy, low, high))
+            result[feature] = perturbed
+            detail.append({
+                "feature": feature,
+                "original": original,
+                "clipped": clipped,
+                "perturbed": perturbed,
+                "epsilon_used": epsilon_per_feature,
+            })
+
+        return result, detail
+
     def apply(
         self,
         features: dict,
@@ -93,49 +163,14 @@ class InputPrivacyLayer:
         delta: float = 1e-6,
     ) -> dict:
         """
-        Perturba las features con ruido DP calibrado y devuelve un dict nuevo.
+        Perturba las features con ruido DP y devuelve solo el dict resultante.
 
-        Pasos por cada feature en FEATURE_BOUNDS:
-          1. Clip al rango (low, high).
-          2. Calcula sensibilidad = high - low.
-          3. Añade ruido Laplace(0, sensitivity/epsilon_in) o
-             Gaussian(0, sensitivity * sqrt(2*ln(1.25/delta)) / epsilon_in).
-          4. Re-clip al mismo rango.
-
-        Cualquier clave no listada en FEATURE_BOUNDS (incluido Time) se copia
-        sin modificación. El dict original no se muta.
-
-        Parameters
-        ----------
-        features : dict
-            Features de la transacción (puede incluir Time y otras claves).
-        epsilon_in : float
-            Parámetro de privacidad. Si <= 0 no se aplica ruido.
-        delta : float
-            Probabilidad de fallo (sólo relevante para mecanismo Gaussian).
-
-        Returns
-        -------
-        dict
-            Copia de features con las features de FEATURE_BOUNDS perturbadas.
+        Wrapper de `apply_with_detail` que descarta el detalle por feature.
+        Úsalo cuando no necesitas el desglose (e.g., producción con
+        EVALUATION_MODE=False). La firma y el tipo de retorno son idénticos
+        a la versión anterior, por lo que los tests existentes siguen pasando.
         """
-        if epsilon_in <= 0.0:
-            return features.copy()
-
-        result = features.copy()
-        for feature, (low, high) in FEATURE_BOUNDS.items():
-            if feature not in result:
-                continue
-            sensitivity = high - low
-            if self.mechanism == "laplace":
-                scale = sensitivity / epsilon_in
-            else:  # gaussian
-                scale = sensitivity * math.sqrt(2.0 * math.log(1.25 / delta)) / epsilon_in
-
-            clipped = float(np.clip(result[feature], low, high))
-            noisy = clipped + self._noise(scale)
-            result[feature] = float(np.clip(noisy, low, high))
-
+        result, _ = self.apply_with_detail(features, epsilon_in, delta)
         return result
 
     def get_info(self) -> dict:
@@ -144,6 +179,7 @@ class InputPrivacyLayer:
             "mechanism": self.mechanism,
             "feature_bounds": FEATURE_BOUNDS,
             "n_features_protected": len(FEATURE_BOUNDS),
+            "budget_composition": "sequential_split",
         }
 
 

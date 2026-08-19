@@ -8,6 +8,8 @@ Cubre los cinco requisitos contractuales:
   3. Time nunca cambia, sin importar epsilon_in.
   4. Todos los valores perturbados quedan dentro de FEATURE_BOUNDS.
   5. El dict original no se muta.
+  6. (nuevo) El reparto de presupuesto es correcto: epsilon_per_feature = epsilon_in / n.
+  7. (nuevo) apply_with_detail devuelve una entrada por feature perturbada, nunca Time.
 """
 
 import sys
@@ -157,6 +159,63 @@ class TestInputPrivacyLayerContract(unittest.TestCase):
         layer = InputPrivacyLayer(seed=5)
         result = layer.apply(features, epsilon_in=1.0)
         self.assertEqual(result["extra_field"], 999.9)
+
+    # ------------------------------------------------------------------
+    # Test 6: reparto de presupuesto secuencial correcto
+    # ------------------------------------------------------------------
+    def test_budget_split_epsilon_per_feature(self):
+        """Con epsilon_in = n_features, epsilon_used por feature == 1.0."""
+        n_perturbable = len([f for f in FEATURE_BOUNDS if f in _SAMPLE_TRANSACTION])
+        epsilon_in = float(n_perturbable)  # 15.0 → epsilon_per_feature = 1.0
+
+        layer = InputPrivacyLayer(seed=42)
+        _, detail = layer.apply_with_detail(_SAMPLE_TRANSACTION, epsilon_in=epsilon_in)
+
+        self.assertEqual(len(detail), n_perturbable)
+        for entry in detail:
+            self.assertAlmostEqual(entry["epsilon_used"], 1.0, places=10)
+
+        total_epsilon = sum(e["epsilon_used"] for e in detail)
+        self.assertAlmostEqual(total_epsilon, epsilon_in, places=10)
+
+    def test_budget_split_sum_equals_epsilon_in(self):
+        """La suma de epsilon_used siempre iguala epsilon_in."""
+        layer = InputPrivacyLayer(seed=7)
+        for eps in (0.5, 1.0, 3.0, 15.0):
+            _, detail = layer.apply_with_detail(_SAMPLE_TRANSACTION, epsilon_in=eps)
+            if detail:
+                self.assertAlmostEqual(
+                    sum(e["epsilon_used"] for e in detail), eps, places=10,
+                    msg=f"Suma de epsilon_used no iguala epsilon_in={eps}",
+                )
+
+    def test_budget_split_zero_epsilon_returns_empty_detail(self):
+        layer = InputPrivacyLayer(seed=0)
+        _, detail = layer.apply_with_detail(_SAMPLE_TRANSACTION, epsilon_in=0.0)
+        self.assertEqual(detail, [])
+
+    # ------------------------------------------------------------------
+    # Test 7: apply_with_detail estructura y cobertura de features
+    # ------------------------------------------------------------------
+    def test_apply_with_detail_returns_entry_per_perturbable_feature(self):
+        """Una entrada por cada feature en FEATURE_BOUNDS presente en input."""
+        layer = InputPrivacyLayer(seed=0)
+        _, detail = layer.apply_with_detail(_SAMPLE_TRANSACTION, epsilon_in=1.0)
+
+        detail_features = [d["feature"] for d in detail]
+        self.assertNotIn("Time", detail_features)
+        for f in FEATURE_BOUNDS:
+            if f in _SAMPLE_TRANSACTION:
+                self.assertIn(f, detail_features,
+                              msg=f"Feature {f} ausente en el detalle")
+
+    def test_apply_with_detail_entry_keys(self):
+        """Cada entrada de detalle tiene los cinco campos requeridos."""
+        layer = InputPrivacyLayer(seed=1)
+        _, detail = layer.apply_with_detail(_SAMPLE_TRANSACTION, epsilon_in=1.0)
+        required_keys = {"feature", "original", "clipped", "perturbed", "epsilon_used"}
+        for entry in detail:
+            self.assertEqual(set(entry.keys()), required_keys)
 
 
 if __name__ == "__main__":

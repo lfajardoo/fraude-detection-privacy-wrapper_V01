@@ -56,3 +56,8 @@ EVALUATION_THRESHOLD = 0.5
 # Número máximo de transacciones por request de evaluación (protección DoS)
 EVALUATION_MAX_TRANSACTIONS = 1000
 
+# Cuando es True, la respuesta HTTP incluye valores originales y perturbados
+# de las features de entrada para calcular métricas (MAE/RMSE de entrada).
+# EN PRODUCCIÓN debe ser False: exponer estos valores filtra el input real.
+EVALUATION_MODE = True
+
