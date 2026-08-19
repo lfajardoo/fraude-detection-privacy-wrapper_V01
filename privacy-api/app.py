@@ -14,6 +14,7 @@ import logging
 # Importar componentes modulares
 from client import model_client
 from privacy_layer import dp_layer
+from input_privacy_layer import InputPrivacyLayer, FEATURE_BOUNDS
 from governor import GovernanceDecision, governor
 from privacy_governor_simple import gobernar_politica
 from evaluator import batch_evaluator
@@ -23,6 +24,9 @@ from config import PRIVACY_API_HOST, PRIVACY_API_PORT, LOG_LEVEL, EVALUATION_MAX
 # Configurar logging
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+# Singleton de la capa de privacidad en entrada
+input_dp_layer = InputPrivacyLayer()
 
 # ===== INICIALIZAR API =====
 app = FastAPI(
@@ -231,8 +235,21 @@ def predict_with_dp(
         if selected_mode not in {"raw", "legacy", "governed"}:
             raise ValueError("mode debe ser raw, legacy o governed")
 
+        # Input DP: perturba features antes de llamar al modelo (defensa contra
+        # ataques de inversión). Usa la decisión del governor legacy (no necesita
+        # fraud_probability, que aún no está disponible antes del primer predict).
+        input_decision = governor.decide(mechanism=mechanism)
+        epsilon_in_input = getattr(input_decision, "epsilon_in", None) or input_decision.epsilon
+        perturbed_dict = input_dp_layer.apply(transaction_dict, epsilon_in=epsilon_in_input)
+        input_privacy_info = {
+            "mechanism": input_dp_layer.mechanism,
+            "epsilon_in": epsilon_in_input,
+            "features_perturbed": [f for f in FEATURE_BOUNDS if f in transaction_dict],
+            "features_excluded": ["Time"],
+        }
+
         # 1. modelo-python: predice una sola vez (la predicción es determinista)
-        model_prediction = model_client.predict(transaction_dict)
+        model_prediction = model_client.predict(perturbed_dict)
 
         results = []
         original_obj = None
@@ -315,6 +332,7 @@ def predict_with_dp(
                     "applied_to_fields": [] if selected_mode == "raw" or governed_policy["politica"] == "P4" else ["fraud_probability", "confidence_score"],
                     "policy": governed_policy,
                     "review_required": governed_policy["politica"] == "P4",
+                    "input_privacy": input_privacy_info,
                 },
             )
             if compare_modes:
