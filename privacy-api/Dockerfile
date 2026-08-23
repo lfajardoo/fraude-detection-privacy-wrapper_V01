@@ -15,6 +15,7 @@ COPY client.py .
 COPY privacy_layer.py .
 COPY governor.py .
 COPY privacy_governor_simple.py .
+COPY input_privacy_layer.py .
 COPY evaluator.py .
 COPY metrics/ ./metrics/
 COPY app.py .

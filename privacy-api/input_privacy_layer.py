@@ -21,12 +21,23 @@ Capa de privacidad diferencial en la entrada (input-side DP).
     Perturbarlo no aporta protección frente a ataques de inversión relevantes
     y puede degradar la coherencia temporal de los logs.
 
-(d) Fundamento teórico: randomized smoothing en inferencia (Cohen et al., 2019,
-    "Certified Adversarial Robustness via Randomized Smoothing", ICML 2019).
-    Añadir ruido calibrado a la entrada antes de la inferencia defiende contra
-    ataques de inversión (model-inversion attacks) y proporciona una garantía
-    de robustez certificada: el clasificador no cambia su predicción dentro de
-    un radio r ≈ sensitivity / epsilon_in en la norma L1 (Laplace) o L2 (Gaussian).
+(d) Fundamento teórico: privacidad diferencial local (LDP) en la entrada.
+    Cada feature se perturba con un mecanismo de DP (Laplace/Gaussian), por lo
+    que esta capa actúa como un randomizador local sobre el vector de entrada:
+    acota cuánto puede distinguir un observador de la salida entre dos valores
+    verdaderos de una feature que difieran dentro de su rango (sensitivity).
+    Esa es la garantía principal frente a intentos de reconstruir o inferir la
+    entrada en etapa de inferencia. El presupuesto se compone de forma
+    secuencial entre features del mismo individuo, como se describe en (b).
+
+    Nota sobre robustez certificada: existe un vínculo formal entre aplicar
+    mecanismos de DP en la entrada y la robustez adversaria certificada
+    (Lecuyer et al., 2019, "Certified Robustness to Adversarial Examples with
+    Differential Privacy", IEEE S&P — PixelDP). Es una propiedad RELACIONADA
+    pero DISTINTA del objetivo de privacidad de esta capa, y no debe
+    presentarse como la defensa principal. No se afirma aquí un radio de
+    certificación concreto: el radio real depende de la separación entre las
+    probabilidades de clase del modelo, no solo de sensitivity/epsilon.
 """
 
 import math

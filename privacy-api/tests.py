@@ -23,6 +23,12 @@ from metrics.privacy_metrics import (
     utility_retention, risk_noise_correlation, privacy_utility_summary,
 )
 
+try:
+    from fastapi.testclient import TestClient as _TestClient
+    _HAS_FASTAPI = True
+except ImportError:
+    _HAS_FASTAPI = False
+
 
 class TestSimplePrivacyGovernor(unittest.TestCase):
     """Pruebas de regresión del árbol hardcodeado del Privacy Governor."""
@@ -454,6 +460,155 @@ class TestGovernorMonotonicity(unittest.TestCase):
         self.assertEqual(epsilon_from_risk(1.0), MONOTONE_EPSILON_SCHEDULE["very_high_risk"])
 
 
+# ===========================================================================
+# Tests del nuevo schema de /predict
+# ===========================================================================
+
+@unittest.skipUnless(_HAS_FASTAPI, "fastapi not installed")
+class TestPredictSchema(unittest.TestCase):
+    """Tests del nuevo schema de respuesta del endpoint /predict."""
+
+    _MODEL_RESPONSE = {
+        "is_fraud": 1,
+        "fraud_probability": 0.85,
+        "confidence_score": 0.90,
+        "message": "FRAUDE DETECTADO",
+    }
+
+    _PAYLOAD = {
+        "Time": 0.0, "V1": -1.35, "V2": -0.07, "V3": 2.53,
+        "V4": 1.38, "V5": -0.33, "V6": 0.46, "V7": 0.24,
+        "V8": 0.10, "V9": 0.36, "V10": 0.09, "V11": -0.55,
+        "V12": -0.62, "V13": -0.99, "V14": -0.31, "Amount": 149.62,
+        "noise_repetitions": 3,
+    }
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        from app import app
+        self.client = TestClient(app)
+    @patch("app.model_client.predict")
+    def _post_predict(self, mock_predict, noise_repetitions=3, mode="governed",
+                      compare_modes=False):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        payload = dict(self._PAYLOAD)
+        payload["noise_repetitions"] = noise_repetitions
+        url = f"/predict?mode={mode}&compare_modes={str(compare_modes).lower()}"
+        resp = self.client.post(url, json=payload)
+        self.assertEqual(resp.status_code, 200)
+        return resp.json()
+
+    @patch("app.model_client.predict")
+    def test_top_level_keys_present(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict()
+        for key in ("request_context", "ground_truth", "input_shield",
+                    "output_shield", "privacy_accounting", "output_shield_metrics"):
+            self.assertIn(key, data, f"Missing top-level key: {key}")
+
+    @patch("app.model_client.predict")
+    def test_mode_comparison_absent_by_default(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict()
+        self.assertNotIn("mode_comparison", data)
+
+    @patch("app.model_client.predict")
+    def test_mode_comparison_present_when_requested(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict(compare_modes=True)
+        self.assertIn("mode_comparison", data)
+        self.assertIn("legacy", data["mode_comparison"])
+        self.assertIn("governed", data["mode_comparison"])
+
+    @patch("app.model_client.predict")
+    def test_ground_truth_matches_model_output(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict()
+        gt = data["ground_truth"]
+        self.assertIn("is_fraud", gt)
+        self.assertIn("fraud_probability", gt)
+        self.assertIn("confidence_score", gt)
+        self.assertIn("distancia_umbral", gt)
+        self.assertEqual(gt["is_fraud"], self._MODEL_RESPONSE["is_fraud"])
+        self.assertAlmostEqual(gt["fraud_probability"], self._MODEL_RESPONSE["fraud_probability"])
+        self.assertAlmostEqual(gt["confidence_score"], self._MODEL_RESPONSE["confidence_score"])
+
+    @patch("app.model_client.predict")
+    def test_ground_truth_is_invariant_across_repetitions(self, mock_predict):
+        """ground_truth deve ser idéntico independientemente de noise_repetitions."""
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data3 = self._post_predict(noise_repetitions=3)
+        data5 = self._post_predict(noise_repetitions=5)
+        self.assertEqual(data3["ground_truth"]["is_fraud"], data5["ground_truth"]["is_fraud"])
+        self.assertAlmostEqual(
+            data3["ground_truth"]["fraud_probability"],
+            data5["ground_truth"]["fraud_probability"],
+        )
+        self.assertAlmostEqual(
+            data3["ground_truth"]["confidence_score"],
+            data5["ground_truth"]["confidence_score"],
+        )
+        self.assertAlmostEqual(
+            data3["ground_truth"]["distancia_umbral"],
+            data5["ground_truth"]["distancia_umbral"],
+        )
+
+    @patch("app.model_client.predict")
+    def test_output_shield_has_n_samples(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        n = 4
+        data = self._post_predict(noise_repetitions=n)
+        self.assertEqual(len(data["output_shield"]["samples"]), n)
+        for s in data["output_shield"]["samples"]:
+            for k in ("index", "is_fraud", "fraud_probability", "confidence_score", "message"):
+                self.assertIn(k, s)
+
+    @patch("app.model_client.predict")
+    def test_output_shield_noise_resampled_per_repetition(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict()
+        self.assertEqual(data["output_shield"]["noise_resampled_per"], "repetition")
+
+    @patch("app.model_client.predict")
+    def test_input_shield_noise_resampled_per_request(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict()
+        self.assertEqual(data["input_shield"]["noise_resampled_per"], "request")
+
+    @patch("app.model_client.predict")
+    def test_privacy_accounting_no_distancia_umbral(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict()
+        self.assertNotIn("distancia_umbral", data["privacy_accounting"].get("policy", {}))
+
+    @patch("app.model_client.predict")
+    def test_output_shield_metrics_renamed_fields(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict(noise_repetitions=2)
+        metrics = data["output_shield_metrics"]
+        self.assertIsNotNone(metrics)
+        self.assertIn("_note", metrics)
+        for field in ("fraud_probability", "confidence_score"):
+            sub = metrics[field]
+            self.assertIn("mae_vs_ground_truth", sub)
+            self.assertIn("rmse_vs_ground_truth", sub)
+            self.assertIn("sample_std", sub)
+            self.assertNotIn("mae", sub)
+            self.assertNotIn("rmse", sub)
+            self.assertNotIn("noise_std", sub)
+        self.assertIn("clipping_suspected", metrics["confidence_score"])
+
+    @patch("app.model_client.predict")
+    def test_request_context_fields(self, mock_predict):
+        mock_predict.return_value = dict(self._MODEL_RESPONSE)
+        data = self._post_predict(noise_repetitions=2, mode="governed")
+        ctx = data["request_context"]
+        self.assertEqual(ctx["noise_repetitions"], 2)
+        self.assertEqual(ctx["endpoint_mode"], "governed")
+        self.assertIn("feature_count", ctx)
+        self.assertIn("compare_modes", ctx)
+
+
 def run_tests():
     """Ejecutar todos los tests"""
     loader = unittest.TestLoader()
@@ -469,6 +624,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestClassificationMetrics))
     suite.addTests(loader.loadTestsFromTestCase(TestPrivacyMetrics))
     suite.addTests(loader.loadTestsFromTestCase(TestGovernorMonotonicity))
+    suite.addTests(loader.loadTestsFromTestCase(TestPredictSchema))
 
     # Ejecutar
     runner = unittest.TextTestRunner(verbosity=2)

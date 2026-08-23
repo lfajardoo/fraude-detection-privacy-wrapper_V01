@@ -78,69 +78,6 @@ class Transaction(BaseModel):
             }
         }
 
-class PredictionValues(BaseModel):
-   """Valores principales devueltos por la predicción."""
-   is_fraud: int = Field(..., description="0=legítimo, 1=fraude")
-   fraud_probability: float = Field(..., description="Probabilidad de fraude [0-1]")
-   confidence_score: float = Field(..., description="Score de confianza [0-1]")
-
-class OriginalValues(BaseModel):
-   """Valores originales devueltos por el modelo (pueden ser None si no existen)."""
-   is_fraud_original: Optional[int] = Field(None, description="is_fraud original")
-   fraud_probability_original: Optional[float] = Field(None, description="fraud_probability original")
-   confidence_score_original: Optional[float] = Field(None, description="confidence_score original")
-
-class PredictionResponseWithDP(BaseModel):
-   """Respuesta enriquecida con valores con privacidad y originales."""
-   with_privacy: PredictionValues = Field(..., description="Valores con privacidad aplicada")
-   original: Optional[OriginalValues] = Field(None, description="Valores originales sin DP")
-   message: str = Field(..., description="Mensaje interpretativo")
-   privacy_info: Dict[str, Any] = Field(..., description="Información sobre privacidad diferencial aplicada")
-
-class NoiseRepetitionResult(BaseModel):
-        """Resultado de una repetición individual de ruido DP."""
-        index: int = Field(..., description="Número de repetición (base 1)")
-        with_privacy: PredictionValues = Field(..., description="Valores con ruido aplicado")
-        message: str = Field(..., description="Mensaje interpretativo")
-        privacy_info: Dict[str, Any] = Field(..., description="Parámetros de privacidad usados en esta repetición")
-        raw: Optional[PredictionValues] = Field(None, description="Predicción sin ruido")
-        legacy: Optional[PredictionValues] = Field(None, description="Predicción con epsilon legacy")
-        governed: Optional[PredictionValues] = Field(None, description="Predicción con política del governor simple")
-
-class NoiseSummary(BaseModel):
-   """MAE, RMSE and noise statistics for a single field across N repetitions."""
-   mae: float = Field(..., description="Mean Absolute Error (original vs noisy)")
-   rmse: float = Field(..., description="Root Mean Square Error (original vs noisy)")
-   rmse_mae_ratio: Optional[float] = Field(
-       None,
-       description="RMSE/MAE ratio — >1 indicates large noise spikes. None with n_samples<2 or mae=0."
-   )
-   noise_std: Optional[float] = Field(
-       None,
-       description="Std dev of |noise| across repetitions. None with n_samples<2. "
-                   "High value = unstable DP output across calls."
-   )
-   n_samples: int = Field(..., description="Number of DP repetitions used")
-
-class RequestMetrics(BaseModel):
-   """Per-request noise metrics computed across all noise_repetitions."""
-   fraud_probability: NoiseSummary = Field(..., description="Noise metrics for fraud_probability")
-   confidence_score: NoiseSummary = Field(..., description="Noise metrics for confidence_score")
-   flip_rate: float = Field(
-       ...,
-       description="Fraction of repetitions where DP noise flipped is_fraud vs original. "
-                   "Meaningful with noise_repetitions>=2."
-   )
-   flip_count: int = Field(..., description="Number of repetitions where is_fraud changed due to DP noise")
-
-class MultiPredictionResponse(BaseModel):
-   """Respuesta con N repeticiones independientes de ruido DP."""
-   noise_repetitions: int = Field(..., description="Número de repeticiones ejecutadas")
-   original: Optional[OriginalValues] = Field(None, description="Valores originales del modelo (sin ruido)")
-   results: List[NoiseRepetitionResult] = Field(..., description="Una respuesta por cada repetición")
-   metrics: Optional[RequestMetrics] = Field(None, description="Noise metrics across all repetitions (None when mode=raw)")
-
-
 def _prediction_values(response: Dict[str, Any]) -> Dict[str, Any]:
    """Extraer únicamente el contrato común de una predicción."""
    return {
@@ -209,7 +146,7 @@ def privacy_info():
     }
 
 
-@app.post("/predict", response_model=MultiPredictionResponse)
+@app.post("/predict")
 def predict_with_dp(
     transaction: Transaction,
     mode: str = "governed",
@@ -222,7 +159,7 @@ def predict_with_dp(
     FLUJO:
     1. Llamar al modelo UNA sola vez (determinista)
     2. Por cada repetición: governor decide → privacy_layer aplica ruido
-    3. Retornar lista de resultados con los valores originales al nivel raíz
+    3. Retornar respuesta estructurada por capa conceptual
 
     El governor se invoca una vez por repetición para que, cuando se integre
     el noise_selector, pueda devolver parámetros distintos en cada iteración.
@@ -235,30 +172,28 @@ def predict_with_dp(
         if selected_mode not in {"raw", "legacy", "governed"}:
             raise ValueError("mode debe ser raw, legacy o governed")
 
-        # Input DP: perturba features antes de llamar al modelo (defensa contra
-        # ataques de inversión). Usa la decisión del governor legacy (no necesita
-        # fraud_probability, que aún no está disponible antes del primer predict).
+        # Input DP: el vector de ruido de entrada se sortea UNA vez por request
+        # (aquí, antes del bucle de repeticiones) → noise_resampled_per = "request"
         input_decision = governor.decide(mechanism=mechanism)
         epsilon_in_input = getattr(input_decision, "epsilon_in", None) or input_decision.epsilon
         perturbed_dict, input_detail = input_dp_layer.apply_with_detail(transaction_dict, epsilon_in=epsilon_in_input)
         _n_perturbed = len([f for f in FEATURE_BOUNDS if f in transaction_dict])
-        input_privacy_info = {
-            "mechanism": input_dp_layer.mechanism,
-            "epsilon_in": epsilon_in_input,
-            "epsilon_in_total": epsilon_in_input,
-            "epsilon_per_feature": epsilon_in_input / _n_perturbed if _n_perturbed > 0 else 0.0,
-            "features_perturbed": [f for f in FEATURE_BOUNDS if f in transaction_dict],
-            "features_excluded": ["Time"],
-        }
 
         # 1. modelo-python: predice una sola vez (la predicción es determinista)
         model_prediction = model_client.predict(perturbed_dict)
 
-        results = []
-        original_obj = None
+        samples: list = []
+        mode_comparison_legacy: list = []
+        mode_comparison_governed: list = []
         noise_pairs_prob: list = []
         noise_pairs_conf: list = []
         flip_count: int = 0
+
+        # ground_truth y metadatos de política se capturan de la iteración 0
+        ground_truth: Dict[str, Any] = {}
+        first_decision = None
+        first_policy: Dict[str, Any] = {}
+        first_applied_to_fields: list = []
 
         for i in range(repetitions):
             raw_result = model_prediction.copy()
@@ -297,14 +232,6 @@ def predict_with_dp(
                 "governed": governed_decision,
             }.get(selected_mode)
 
-            # Extraer valores originales solo en la primera iteración (son iguales en todas)
-            if i == 0:
-                original_obj = OriginalValues(
-                    is_fraud_original=model_prediction.get("is_fraud"),
-                    fraud_probability_original=model_prediction.get("fraud_probability"),
-                    confidence_score_original=model_prediction.get("confidence_score"),
-                )
-
             orig_prob = float(model_prediction["fraud_probability"])
             orig_conf = float(model_prediction["confidence_score"])
             orig_is_fraud = int(model_prediction["is_fraud"])
@@ -312,61 +239,124 @@ def predict_with_dp(
             noisy_conf = float(result_with_dp.get("confidence_score"))
             # Derive is_fraud from the noisy probability (the DP-protected decision)
             noisy_is_fraud = 1 if noisy_prob > 0.5 else 0
+
+            if i == 0:
+                ground_truth = {
+                    "is_fraud": orig_is_fraud,
+                    "fraud_probability": orig_prob,
+                    "confidence_score": orig_conf,
+                    # laboratory_only: derivado del score VERDADERO, no es metadato de privacidad
+                    "distancia_umbral": governed_policy["distancia_umbral"],
+                }
+                first_decision = selected_decision
+                first_policy = governed_policy
+                first_applied_to_fields = (
+                    []
+                    if selected_mode == "raw" or governed_policy["politica"] == "P4"
+                    else ["fraud_probability", "confidence_score"]
+                )
+
             if selected_mode != "raw":
                 noise_pairs_prob.append((orig_prob, noisy_prob))
                 noise_pairs_conf.append((orig_conf, noisy_conf))
                 if noisy_is_fraud != orig_is_fraud:
                     flip_count += 1
 
-            privacy_info_dict = {
-                    "mode": selected_mode,
-                    "mechanism": selected_decision.mechanism if selected_decision else None,
-                    "epsilon": selected_decision.epsilon if selected_decision else 0.0,
-                    "delta": selected_decision.delta if selected_decision else 0.0,
-                    "budget_allowed": selected_decision.budget_allowed if selected_decision else True,
-                    "applied_to_fields": [] if selected_mode == "raw" or governed_policy["politica"] == "P4" else ["fraud_probability", "confidence_score"],
-                    "policy": governed_policy,
-                    "review_required": governed_policy["politica"] == "P4",
-                    "input_privacy": input_privacy_info,
-                }
-            if EVALUATION_MODE:
-                privacy_info_dict["input_perturbation_detail"] = input_detail
+            samples.append({
+                "index": i + 1,
+                "is_fraud": noisy_is_fraud,
+                "fraud_probability": noisy_prob,
+                "confidence_score": noisy_conf,
+                "message": result_with_dp.get("message", ""),
+            })
 
-            result = NoiseRepetitionResult(
-                index=i + 1,
-                with_privacy=PredictionValues(
-                    is_fraud=noisy_is_fraud,
-                    fraud_probability=noisy_prob,
-                    confidence_score=noisy_conf,
-                ),
-                message=result_with_dp.get("message", ""),
-                privacy_info=privacy_info_dict,
-            )
             if compare_modes:
-                result.raw = PredictionValues(**_prediction_values(raw_result))
-                result.legacy = PredictionValues(**_prediction_values(legacy_result))
-                result.governed = PredictionValues(**_prediction_values(governed_result))
-            results.append(result)
+                mode_comparison_legacy.append({"index": i + 1, **_prediction_values(legacy_result)})
+                mode_comparison_governed.append({"index": i + 1, **_prediction_values(governed_result)})
 
-        request_metrics = None
+        # epsilon_out del primer iter (decisión nominal, antes de posible budget exhaustion)
+        epsilon_out_per_sample = (
+            first_decision.epsilon_out
+            if first_decision is not None and first_decision.epsilon_out is not None
+            else 0.0
+        )
+
+        response: Dict[str, Any] = {
+            "request_context": {
+                "endpoint_mode": selected_mode,
+                "compare_modes": compare_modes,
+                "noise_repetitions": repetitions,
+                "feature_count": _n_perturbed,
+            },
+            "ground_truth": ground_truth,
+            "input_shield": {
+                "mechanism": input_dp_layer.mechanism,
+                "epsilon_in_total": epsilon_in_input,
+                "epsilon_per_feature": epsilon_in_input / _n_perturbed if _n_perturbed > 0 else 0.0,
+                # ruido de entrada sorteado UNA vez por request (antes del loop de repeticiones)
+                "noise_resampled_per": "request",
+                "perturbation_detail": input_detail if EVALUATION_MODE else None,
+            },
+            "output_shield": {
+                "mechanism": first_decision.mechanism if first_decision is not None else None,
+                "epsilon_out": epsilon_out_per_sample,
+                # ruido de salida sorteado una vez por repetición, dentro del loop
+                "noise_resampled_per": "repetition",
+                "applied_to_fields": first_applied_to_fields,
+                "samples": samples,
+            },
+            "privacy_accounting": {
+                "epsilon_in_total": epsilon_in_input,
+                "epsilon_out_per_sample": epsilon_out_per_sample,
+                "noise_repetitions": repetitions,
+                # composición secuencial básica (Dwork & Roth 2014, Theorem 3.14)
+                "epsilon_out_effective_sequential_basic": repetitions * epsilon_out_per_sample,
+                "delta": first_decision.delta if first_decision is not None else 0.0,
+                "budget_allowed": first_decision.budget_allowed if first_decision is not None else True,
+                # distancia_umbral excluida: pertenece a ground_truth, no a accounting
+                "policy": {k: v for k, v in first_policy.items() if k != "distancia_umbral"},
+                "review_required": first_policy.get("politica") == "P4",
+            },
+        }
+
+        if compare_modes:
+            response["mode_comparison"] = {
+                "legacy": mode_comparison_legacy,
+                "governed": mode_comparison_governed,
+            }
+
         if noise_pairs_prob:
             n_reps = len(noise_pairs_prob)
-            prob_summary = noise_summary(noise_pairs_prob)
-            conf_summary = noise_summary(noise_pairs_conf)
-            request_metrics = RequestMetrics(
-                fraud_probability=NoiseSummary(**prob_summary),
-                confidence_score=NoiseSummary(**conf_summary),
-                flip_count=flip_count,
-                flip_rate=flip_count / n_reps,
-            )
+            prob_sum = noise_summary(noise_pairs_prob)
+            conf_sum = noise_summary(noise_pairs_conf)
+            conf_std = conf_sum["noise_std"]
+            response["output_shield_metrics"] = {
+                "_note": "Caracteriza la dispersion del ruido de SALIDA sobre p'. NO mide privacidad de la entrada.",
+                "fraud_probability": {
+                    "mae_vs_ground_truth": prob_sum["mae"],
+                    "rmse_vs_ground_truth": prob_sum["rmse"],
+                    "rmse_mae_ratio": prob_sum["rmse_mae_ratio"],
+                    "sample_std": prob_sum["noise_std"],
+                    "n_samples": n_reps,
+                },
+                "confidence_score": {
+                    "mae_vs_ground_truth": conf_sum["mae"],
+                    "rmse_vs_ground_truth": conf_sum["rmse"],
+                    "rmse_mae_ratio": conf_sum["rmse_mae_ratio"],
+                    "sample_std": conf_std,
+                    "n_samples": n_reps,
+                    "clipping_suspected": bool(
+                        conf_std is not None and conf_std == 0.0 and conf_sum["mae"] > 0
+                    ),
+                },
+                "flip_rate": flip_count / n_reps,
+                "flip_count": flip_count,
+            }
+        else:
+            response["output_shield_metrics"] = None
 
         logger.info(f"Predicción completada: {repetitions} repeticion(es) de ruido DP")
-        return MultiPredictionResponse(
-            noise_repetitions=repetitions,
-            original=original_obj,
-            results=results,
-            metrics=request_metrics,
-        )
+        return response
 
     except ConnectionError as e:
         logger.error(f"Error de conexión: {e}")
@@ -384,13 +374,13 @@ def predict_with_dp(
         raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
 
 
-@app.post("/predict-laplace", response_model=MultiPredictionResponse)
+@app.post("/predict-laplace")
 def predict_laplace(transaction: Transaction):
     """Alias: fuerza Laplace sin modificar estado global."""
     return predict_with_dp(transaction, mechanism="laplace")
 
 
-@app.post("/predict-gaussian", response_model=MultiPredictionResponse)
+@app.post("/predict-gaussian")
 def predict_gaussian(transaction: Transaction):
     """Alias: fuerza Gaussian sin modificar estado global."""
     return predict_with_dp(transaction, mechanism="gaussian")

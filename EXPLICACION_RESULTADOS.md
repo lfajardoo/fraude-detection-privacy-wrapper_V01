@@ -340,7 +340,7 @@ Presupuesto persiste y se acumula
         "applied_to_fields": ["fraud_probability", "confidence_score"],
         "policy": {
           "modo": "governed",
-          "politica": "P3",
+        ": "P3",
           "epsilon_in": 0.5,
           "epsilon_out": 0.8,
           "distancia_umbral": 0.469031816883348
