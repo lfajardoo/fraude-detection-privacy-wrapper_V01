@@ -55,6 +55,7 @@ class Transaction(BaseModel):
     V14: float
     Amount: float = Field(..., description="Monto de la transacción")
     noise_repetitions: int = Field(1, ge=1, le=20, description="Cantidad de veces que se aplica ruido DP (una respuesta por repetición)")
+    epsilon_in: Optional[float] = Field(None, ge=0.0, description="LAB ONLY: override del epsilon_in del input shield para barridos.")
 
     class Config:
         json_schema_extra = {
@@ -166,7 +167,7 @@ def predict_with_dp(
     """
     try:
         # Excluir noise_repetitions antes de enviar al modelo-python
-        transaction_dict = transaction.model_dump(exclude={"noise_repetitions"})
+        transaction_dict = transaction.model_dump(exclude={"noise_repetitions", "epsilon_in"})
         repetitions = transaction.noise_repetitions
         selected_mode = mode.lower()
         if selected_mode not in {"raw", "legacy", "governed"}:
@@ -175,7 +176,11 @@ def predict_with_dp(
         # Input DP: el vector de ruido de entrada se sortea UNA vez por request
         # (aquí, antes del bucle de repeticiones) → noise_resampled_per = "request"
         input_decision = governor.decide(mechanism=mechanism)
-        epsilon_in_input = getattr(input_decision, "epsilon_in", None) or input_decision.epsilon
+        epsilon_in_input = (
+            transaction.epsilon_in
+            if transaction.epsilon_in is not None
+            else (getattr(input_decision, "epsilon_in", None) or input_decision.epsilon)
+        )
         perturbed_dict, input_detail = input_dp_layer.apply_with_detail(transaction_dict, epsilon_in=epsilon_in_input)
         _n_perturbed = len([f for f in FEATURE_BOUNDS if f in transaction_dict])
 
