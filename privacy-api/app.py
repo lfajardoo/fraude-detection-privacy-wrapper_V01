@@ -56,6 +56,7 @@ class Transaction(BaseModel):
     Amount: float = Field(..., description="Monto de la transacción")
     noise_repetitions: int = Field(1, ge=1, le=20, description="Cantidad de veces que se aplica ruido DP (una respuesta por repetición)")
     epsilon_in: Optional[float] = Field(None, ge=0.0, description="LAB ONLY: override del epsilon_in del input shield para barridos.")
+    epsilon_out: Optional[float] = Field(None, ge=0.0, description="LAB ONLY: override del epsilon del output shield (ruido sobre fraud_probability) para barridos.")
 
     class Config:
         json_schema_extra = {
@@ -167,7 +168,7 @@ def predict_with_dp(
     """
     try:
         # Excluir noise_repetitions antes de enviar al modelo-python
-        transaction_dict = transaction.model_dump(exclude={"noise_repetitions", "epsilon_in"})
+        transaction_dict = transaction.model_dump(exclude={"noise_repetitions", "epsilon_in", "epsilon_out"})
         repetitions = transaction.noise_repetitions
         selected_mode = mode.lower()
         if selected_mode not in {"raw", "legacy", "governed"}:
@@ -203,6 +204,8 @@ def predict_with_dp(
         for i in range(repetitions):
             raw_result = model_prediction.copy()
             legacy_decision = governor.decide(mechanism=mechanism)
+            if transaction.epsilon_out is not None:
+                legacy_decision.epsilon = transaction.epsilon_out
             governed_policy = gobernar_politica(
                 fraud_probability=float(raw_result["fraud_probability"]),
                 confidence_score=float(raw_result["confidence_score"]),
