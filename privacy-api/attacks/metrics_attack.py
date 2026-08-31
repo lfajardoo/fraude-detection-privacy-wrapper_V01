@@ -51,7 +51,7 @@ def build_curve(
     for epsilon, errors in sorted(resultados_por_epsilon.items()):
         values = list(errors)
         curve.append({
-            "epsilon_out": float(epsilon),
+            "epsilon": float(epsilon),
             "mae": mae(values),
             "rmse": rmse(values),
             "mean_error": mean_error(values),   # sesgo agregado (con advertencia)

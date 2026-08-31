@@ -93,48 +93,48 @@ def run_experiment(
     targets: List[dict],
     secret_name: str = "V4",
     K: int = 20,
-    epsilons=DEFAULT_EPSILONS,
+    epsilons_in=DEFAULT_EPSILONS,
     tol_frac: float = 0.25,
-    epsilon_in_fixed: float = 2,
+    epsilon_out_fixed: float = 50.0,
+    R: int = 8,
+    snr_threshold: float = 2.0,
+    probe_lo_pct: float = 25.0,
+    probe_hi_pct: float = 75.0,
 ) -> List[dict]:
-    probe_lo, probe_hi = public_probe_range(pool, secret_name)
+    # CAMINO 2: span de sondeo ajustable por percentiles.  Percentiles menos
+    # extremos (25/75 en vez de 5/95) mantienen probe_lo y probe_hi en la zona
+    # lineal del logit, donde p no está tan cerca de 0/1 que el logit se dispare.
+    probe_lo, probe_hi = public_probe_range(
+        pool, secret_name, lo_pct=probe_lo_pct, hi_pct=probe_hi_pct
+    )
     tol_abs = tol_frac * secret_scale(pool, secret_name)
-
-    # Conocimiento público del atacante: rango válido y valor "por defecto"
-    # (la media del pool) al que recurre cuando no puede estimar nada.
     lo, hi = PUBLIC_BOUNDS.get(secret_name, (probe_lo, probe_hi))
     public_mean = float(np.mean([row[secret_name] for row in pool]))
-
-    # Línea base: error de NO atacar, solo adivinar la media pública.
-    # Es la vara contra la cual se juzga el ataque: si el ataque no baja de
-    # aquí, no recuperó nada útil.
     baseline_errors = [public_mean - t[secret_name] for t in targets]
     baseline_mae = float(np.mean(np.abs(baseline_errors))) if baseline_errors else 0.0
 
+    print(f"  [probes] {secret_name} en p{probe_lo_pct:.0f}/p{probe_hi_pct:.0f} = "
+          f"[{probe_lo:.4f}, {probe_hi:.4f}]  (span={probe_hi - probe_lo:.4f})  R={R}")
+
     results: Dict[float, List[float]] = {}
-    for epsilon in epsilons:
-        # epsilon_in_fixed desactiva (o fija) el input shield; epsilon barre el output shield
-        client = HttpAttackClient(base_url, epsilon_in=epsilon_in_fixed, epsilon_out=epsilon)
-        print(f"  [barrido] epsilon_in={epsilon_in_fixed}, epsilon_out={epsilon}...", flush=True)
+    for epsilon_in in epsilons_in:
+        client = HttpAttackClient(base_url, epsilon_in=epsilon_in, epsilon_out=epsilon_out_fixed)
+        print(f"  [barrido] epsilon_in={epsilon_in}, epsilon_out={epsilon_out_fixed}...", flush=True)
         errors = []
         for target in targets:
             known = {k: v for k, v in target.items() if k != secret_name}
             p_target = denoise(client, target, K)
             estimate = invert_feature(
-                client, known, secret_name, probe_lo, probe_hi, K, p_target
+                client, known, secret_name, probe_lo, probe_hi, K, p_target,
+                R=R, snr_threshold=snr_threshold,
             )
             if estimate is None:
-                # pendiente indistinguible de cero → el atacante no puede
-                # estimar: recurre a la media pública (su mejor apuesta ciega).
                 estimate = public_mean
             else:
-                # acota a valores posibles: evita las explosiones numéricas.
                 estimate = min(hi, max(lo, estimate))
             errors.append(estimate - target[secret_name])
-        results[epsilon] = errors
-
+        results[epsilon_in] = errors
     curve = build_curve(results, tol=tol_abs)
-    # anexa la línea base a cada fila para poder compararla de un vistazo
     for row in curve:
         row["baseline_mae"] = baseline_mae
         row["beats_baseline"] = row["mae"] < baseline_mae
@@ -143,6 +143,10 @@ def run_experiment(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--epsilon-out", type=float, default=50.0,
+                        help="Epsilon fijo del output shield durante el barrido. "
+                         "Debe ser alto (>=50) para evitar sesgo de clipping "
+                         "en la inversión logit. Default=50.0.")
     parser.add_argument("--base-url", default="http://localhost:8001")
     parser.add_argument("--dataset", type=Path,
                         default=Path(__file__).parent.parent / "modelo-python" / "dataset" / "creditcard.csv")
@@ -152,21 +156,36 @@ def main() -> None:
     parser.add_argument("--public-size", type=int, default=200,
                         help="Filas reservadas al pool público para los probes.")
     parser.add_argument("--K", type=int, default=20)
-    parser.add_argument("--epsilons", type=float, nargs="+", default=list(DEFAULT_EPSILONS),
-                        help="Lista de epsilon_in a barrer, separados por espacio.")
+    parser.add_argument("--epsilons-in", type=float, nargs="+", default=list(DEFAULT_EPSILONS),
+                        help="Lista de epsilon_in a barrer (eje de la curva), separados por espacio.")
     parser.add_argument("--tol-frac", type=float, default=0.25,
                         help="Tolerancia de éxito como fracción de la std pública del secreto.")
-    parser.add_argument("--epsilon-in", type=float, default=1.0,
-                        help="Epsilon fijo del input shield durante el barrido (default=1.0, valor del governor actual).")
+
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
+    parser.add_argument("--R", type=int, default=8,
+                        help="Repeticiones del sondeo para el guard estadístico "
+                             "(Camino 1). Más alto = estimación de pendiente más "
+                             "estable, pero R× más requests. Default=8.")
+    parser.add_argument("--snr-threshold", type=float, default=2.0,
+                        help="Umbral señal/ruido del guard: |slope|/std(slope) "
+                             "debe superarlo para no abstenerse. Default=2.0.")
+    parser.add_argument("--probe-lo-pct", type=float, default=25.0,
+                        help="Percentil inferior del span de sondeo (Camino 2). "
+                             "Menos extremo (25 vs 5) = span más estrecho, más "
+                             "lineal. Default=25.0.")
+    parser.add_argument("--probe-hi-pct", type=float, default=75.0,
+                        help="Percentil superior del span de sondeo (Camino 2). "
+                             "Default=75.0.")
     args = parser.parse_args()
 
     transactions = load_transactions(args.dataset, args.limit)
     pool, targets = split_public_targets(transactions, args.public_size)
     curve = run_experiment(
         args.base_url, pool, targets, args.secret, args.K,
-        epsilons=args.epsilons, tol_frac=args.tol_frac,
-        epsilon_in_fixed=args.epsilon_in,
+        epsilons_in=args.epsilons_in, tol_frac=args.tol_frac,
+        epsilon_out_fixed=args.epsilon_out,
+        R=args.R, snr_threshold=args.snr_threshold,
+        probe_lo_pct=args.probe_lo_pct, probe_hi_pct=args.probe_hi_pct,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -174,22 +193,21 @@ def main() -> None:
         json.dumps(curve, indent=2), encoding="utf-8"
     )
     fieldnames = list(curve[0].keys()) if curve else [
-        "epsilon_out", "mae", "rmse", "mean_error", "n", "success_rate", "tol_abs"
+        "epsilon", "mae", "rmse", "mean_error", "n", "success_rate", "tol_abs"
     ]
     with (args.output_dir / "inversion_curve.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(curve)
 
-    print(f"pool={len(pool)}  targets={len(targets)}  secret={args.secret}  K={args.K}  epsilon_in_fijo={args.epsilon_in}")
+    print(f"pool={len(pool)}  targets={len(targets)}  secret={args.secret}  K={args.K}  epsilon_out_fijo={args.epsilon_out}")
     if curve:
         print(f"linea_base (adivinar la media) MAE = {curve[0]['baseline_mae']:.4f}")
         print("  -> el ataque solo 'gana' en las filas donde MAE < linea_base\n")
-    print("epsilon_out\tMAE_ataque\t¿gana?")
+    print("epsilon_in\tMAE_ataque\t¿gana?")
     for row in curve:
         verdict = "SI" if row["beats_baseline"] else "no"
-        print(f"{row['epsilon_out']:>8.0f}\t{row['mae']:.4f}\t\t{verdict}")
-
+        print(f"{row['epsilon']:>8.0f}\t{row['mae']:.4f}\t\t{verdict}")
 
 if __name__ == "__main__":
     main()
