@@ -22,7 +22,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from attacks.api_client import HttpAttackClient
-from attacks.inversion_attack import denoise, invert_feature
+from attacks.inversion_attack import _logit, denoise, invert_feature
 from attacks.metrics_attack import build_curve
 
 
@@ -116,6 +116,32 @@ def run_experiment(
     print(f"  [probes] {secret_name} en p{probe_lo_pct:.0f}/p{probe_hi_pct:.0f} = "
           f"[{probe_lo:.4f}, {probe_hi:.4f}]  (span={probe_hi - probe_lo:.4f})  R={R}")
 
+        # --- Diagnóstico del guard: reproduce las R pendientes que evalúa invert_feature ---
+    if targets:
+        diag_eps_in = max(epsilons_in)
+        diag_client = HttpAttackClient(
+            base_url, epsilon_in=diag_eps_in, epsilon_out=epsilon_out_fixed
+        )
+        print(f"  [diag] ε_in={diag_eps_in:g}, ε_out={epsilon_out_fixed:g}, R={R}, K={K}")
+        for i in [0, len(targets)//2, len(targets)-1]:
+            t = targets[i]
+            known = {k: v for k, v in t.items() if k != secret_name}
+            slopes = []
+            for _ in range(R):
+                p_lo = denoise(diag_client, {**known, secret_name: probe_lo}, K)
+                p_hi = denoise(diag_client, {**known, secret_name: probe_hi}, K)
+                slopes.append((_logit(p_hi) - _logit(p_lo)) / (probe_hi - probe_lo))
+            m = sum(slopes) / R
+            sd = (sum((s - m) ** 2 for s in slopes) / (R - 1)) ** 0.5
+            sem = sd / (R ** 0.5)
+            snr = abs(m) / sem if sem > 0 else float("inf")
+            signos = sum(1 for s in slopes if s > 0)
+            print(f"         target[{i}] Class={t.get('Class','?')}: "
+                  f"slope_mean={m:+.4f}  slope_std={sd:.4f}  SNR={snr:.2f}  "
+                  f"(umbral={snr_threshold})  signos +/-: {signos}/{R-signos}  "
+                  f"[{'PASA' if snr >= snr_threshold else 'ABSTIENE'}]")
+            print(f"           slopes: {[f'{s:+.3f}' for s in slopes]}")
+
     results: Dict[float, List[float]] = {}
     for epsilon_in in epsilons_in:
         client = HttpAttackClient(base_url, epsilon_in=epsilon_in, epsilon_out=epsilon_out_fixed)
@@ -161,6 +187,10 @@ def main() -> None:
     parser.add_argument("--tol-frac", type=float, default=0.25,
                         help="Tolerancia de éxito como fracción de la std pública del secreto.")
 
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Semilla RNG para reproducibilidad. Si no se pasa, "
+                             "cada corrida es aleatoria.")
+
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument("--R", type=int, default=8,
                         help="Repeticiones del sondeo para el guard estadístico "
@@ -177,6 +207,14 @@ def main() -> None:
                         help="Percentil superior del span de sondeo (Camino 2). "
                              "Default=75.0.")
     args = parser.parse_args()
+
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"[seed] usando semilla fija = {args.seed}")
+    else:
+        print("[seed] semilla aleatoria (no reproducible)")
 
     transactions = load_transactions(args.dataset, args.limit)
     pool, targets = split_public_targets(transactions, args.public_size)

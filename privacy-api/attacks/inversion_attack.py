@@ -31,7 +31,7 @@ def invert_feature(
     K: int,
     p_target: float,
     R: int = 3,
-    snr_threshold: float = 2.0,
+    snr_threshold: float = 5.0,
 ) -> Optional[float]:
     """Estima una feature secreta mediante aproximación lineal local.
 
@@ -66,15 +66,24 @@ def invert_feature(
         logit_high = _logit(denoise(client, high_features, K))
         slopes.append((logit_high - logit_low) / span)
 
+
     slope_mean = sum(slopes) / len(slopes)
+
+    # Guard degenerado: si todas las pendientes son idénticas y valen 0,
+    # slope_std=0 haría que el guard no dispare y luego se divida por cero.
+    if slope_mean == 0.0:
+        return None
 
     # Guard estadístico: ¿la pendiente media es distinguible de cero?
     if R >= 2:
         slope_std = (sum((s - slope_mean) ** 2 for s in slopes) / (R - 1)) ** 0.5
-        if slope_std > 0 and abs(slope_mean) < snr_threshold * slope_std:
-            return None  # señal indistinguible de cero → abstención
+        # El guard juzga la precisión de la MEDIA, no la dispersión de una medición
+        # individual: por eso el error estándar (std/sqrt(R)), no std. Usar std
+        # directamente hace el guard sqrt(R) veces más estricto y anula el beneficio de R.
+        slope_sem = slope_std / (R ** 0.5)
+        if slope_sem > 0 and abs(slope_mean) < snr_threshold * slope_sem:
+            return None
     else:
-        # Fallback: con R=1 no hay std; guard numérico conservador
         if abs(slope_mean) < 1e-4:
             return None
 
