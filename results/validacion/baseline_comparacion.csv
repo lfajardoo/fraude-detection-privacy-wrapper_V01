@@ -1,0 +1,12 @@
+# Lectura de la tabla (neutral; compara a igual parametro epsilon nominal, no a igual garantia ante un mismo adversario).
+# A epsilon=1, la respuesta aleatorizada acierta la decision con prob. 73.1% (forma cerrada).
+# El output shield a eps_out=1 acierta 63.8% en promedio sobre p en [0.01, 0.05, 0.1, 0.25, 0.4, 0.6, 0.75, 0.9, 0.95, 0.99] (peor p: 53.6%).
+# El input shield a eps_in=1 usa b/rango = 15 (n/eps_in, n=15): con b muy superior al rango, las features quedan casi destruidas en una consulta.
+# Esto no invalida ninguno de los enfoques: protegen cosas distintas. La respuesta aleatorizada protege el resultado publicado y supone que el contenido de la consulta llega sin ruido a quien evalua el modelo; el input shield protege el contenido de la consulta; el output shield, la probabilidad publicada.
+# Los epsilon nominales tampoco son directamente equiparables: eps_in es un presupuesto por registro repartido entre 15 features (eps_in/15 por feature), eps_out cubre una probabilidad (delta=1) y RR una etiqueta binaria.
+# Fuga medida: rr_eps_lb es la del baseline; wrapper_eps_lb la del output shield; wrapper_in_eps_lb la del input shield (feature auditada). *_ajuste = eps_lb / eps teorico.
+epsilon,rr_prob_acierto,wrapper_out_prob_acierto,wrapper_out_prob_acierto_peor_p,wrapper_in_b_relativo,rr_eps_lb,wrapper_eps_lb,wrapper_in_eps_lb,rr_ajuste,wrapper_ajuste,wrapper_in_ajuste,wrapper_in_eps_teorico_por_feature
+0.5,0.6224593312018546,0.5776749999999999,0.5155,30.0,0.33217474736494396,0.32823091620075684,0.0,0.6643494947298879,0.6564618324015137,0.0,0.03333333333333333
+1.0,0.7310585786300049,0.638,0.53575,15.0,0.8832251501132263,0.8634869238483803,0.0,0.8832251501132263,0.8634869238483803,0.0,0.06666666666666667
+2.0,0.8807970779778824,0.737325,0.585,7.5,1.8068482814052544,1.6776658325496003,0.06952050563615109,0.9034241407026272,0.8388329162748002,0.5214037922711332,0.13333333333333333
+3.0,0.9525741268224333,0.7996,0.62675,5.0,2.6589417880616493,2.672398104584773,0.15226599633033291,0.8863139293538831,0.8907993681949243,0.7613299816516645,0.2

@@ -2,3 +2,5 @@
 pytest>=7.4
 httpx>=0.25      # lo exige starlette.testclient en tests.py
 scipy>=1.11      # Clopper-Pearson, KS, binomtest
+diffprivlib>=0.6.6   # baseline: respuesta aleatorizada (validacion/baseline_rr.py)
+scikit-learn>=1.6,<1.9  # diffprivlib 0.6.6 no importa con scikit-learn 1.9

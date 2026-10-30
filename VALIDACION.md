@@ -50,7 +50,10 @@ python -m validacion.run_validacion --nivel todos --T 2000 --alpha 0.01 --seed 1
   `--eps-in 1,15,45` y `--eps-out 0.5,1,2` cambian el barrido.
 - Una ruta `--out` relativa se interpreta respecto a la **raíz del repositorio**
   (salida por defecto: `results/validacion/`).
-- Salidas: `nivel2_analitica.{json,csv}`, `nivel2_garantias.csv`, `nivel3_distinguibilidad.{json,csv}`.
+- `--baseline` añade el baseline externo (ver [Baseline externo](#baseline-externo-respuesta-aleatorizada));
+  `--eps-rr 0.5,1,2,3` cambia su barrido. Requiere `diffprivlib` (`requirements-dev.txt`).
+- Salidas: `nivel2_analitica.{json,csv}`, `nivel2_garantias.csv`, `nivel3_distinguibilidad.{json,csv}`
+  y, con `--baseline`, `baseline_rr.{json,csv}` y `baseline_comparacion.csv`.
 - Código de salida `1` si hay `VIOLACIÓN` o un control falla (hallazgo, no se ajusta el test).
 - Opcional extremo a extremo (el **modelo entra en la cadena**; el servidor no está sembrado, así
   que no es reproducible): levantar modelo + API y añadir `--e2e-url http://localhost:8001`
@@ -115,6 +118,77 @@ se obtendría con los conteos esperados si el mecanismo fuera exactamente el nom
 
 La corrida e2e usó el servicio de modelo que respondía en `localhost:8000` (modelo de ejemplo,
 con poca sensibilidad a V4); es solo ilustrativa.
+
+## Baseline externo: respuesta aleatorizada
+
+Punto de comparación con la práctica estándar de DP local: la **respuesta aleatorizada**
+(Warner, 1965) sobre la decisión binaria `is_fraud`, vía `diffprivlib.mechanisms.Binary`. Se publica
+la etiqueta real con probabilidad `e^ε/(1+e^ε)` y la contraria con `1/(1+e^ε)`. Código en
+`privacy-api/validacion/baseline_rr.py`; tests en `tests/test_baseline_rr.py`.
+
+**Por qué este baseline.** Es otra *clase* de mecanismo (aleatoriza una etiqueta, no suma ruido
+continuo) y otra arquitectura de protección, no otra variante de Laplace; es agnóstico al modelo
+(solo necesita la etiqueta); y su garantía es exacta: ε con vecinos extremos (dos decisiones
+opuestas). No se incluyen `LaplaceTruncated` ni otros Laplace: serían redundantes con la capa
+existente.
+
+**Qué protege cada enfoque (no son intercambiables).**
+
+| Enfoque | Protege | Supone |
+|---|---|---|
+| Respuesta aleatorizada | el **resultado** de la consulta (la decisión publicada) | el contenido de la consulta llega sin ruido a quien evalúa el modelo |
+| Input shield | el **contenido** de la consulta (las features) | — |
+| Output shield | la **probabilidad** publicada (Δ = 1); la decisión derivada es post-procesamiento | — |
+
+**Auditoría.** Reusa el Nivel 3 sin reimplementarlo (`eps_lb`, `techo_eps_lb`, `veredicto`,
+`_auditar`): vecinos `decision=False` / `decision=True`, evento `salida == True`, p₀ = 1/(1+e^ε),
+p₁ = e^ε/(1+e^ε). Mismos tres controles: mecanismo correcto, error inyectado (probabilidad de volteo
+de 2ε en vez de la de ε) y sin ruido (ε=10³⁰, ε_LB = techo). Las filas tienen las mismas claves que
+las del Nivel 3. Barrido por defecto ε ∈ {0.5, 1, 2, 3}.
+
+**Calibración del instrumento.** Como la respuesta aleatorizada alcanza exactamente e^ε, su ε_LB
+debería recuperar ε con el único límite del tamaño de muestra (Clopper-Pearson). Si aquí ε_LB
+quedara lejos del esperado (`eps_lb_esperado`), el problema estaría en la auditoría y no en el
+mecanismo.
+
+**Comparación a igual ε nominal** (`results/validacion/baseline_comparacion.csv`; las primeras
+líneas, que empiezan por `#`, son la lectura; con pandas: `read_csv(..., comment="#")`):
+
+- `rr_prob_acierto`: `e^ε/(1+e^ε)` (forma cerrada).
+- `wrapper_out_prob_acierto`: P(`prob_ruidosa > 0.5` coincide con `p > 0.5`) del output shield a
+  `ε_out = ε`. Depende de `p`, por lo que se **simula** con la capa real sobre
+  `p ∈ {0.01, 0.05, 0.10, 0.25, 0.40, 0.60, 0.75, 0.90, 0.95, 0.99}` y se promedia
+  (`..._peor_p` = el mínimo; la forma cerrada por `p` es `1 − ½·e^{−ε|p−½|}`, usada como verificación en los tests).
+- `wrapper_in_b_relativo`: `b/rango = n/ε_in = 15/ε`; cuánto ruido mete el input shield.
+- `rr_eps_lb`, `wrapper_eps_lb` (output shield), `wrapper_in_eps_lb` (input shield, V4) y los
+  `*_ajuste` = ε_LB/ε teórico. El ε teórico del input shield es ε/15 por feature.
+
+Resultado de referencia (`--T 2000 --alpha 0.01 --seed 1`):
+
+| ε | RR acierto | out acierto (peor p) | in b/rango | RR ε_LB (ajuste) | out ε_LB (ajuste) | in ε_LB |
+|---|---|---|---|---|---|---|
+| 0.5 | 62.2 % | 57.8 % (51.6 %) | 30 | 0.332 (0.66) | 0.328 (0.66) | 0.000 |
+| 1 | 73.1 % | 63.8 % (53.6 %) | 15 | 0.883 (0.88) | 0.863 (0.86) | 0.000 |
+| 2 | 88.1 % | 73.7 % (58.5 %) | 7.5 | 1.807 (0.90) | 1.678 (0.84) | 0.070 |
+| 3 | 95.3 % | 80.0 % (62.7 %) | 5 | 2.659 (0.89) | 2.672 (0.89) | 0.152 |
+
+**Lectura (neutral).** A igual ε nominal, la respuesta aleatorizada conserva más utilidad en la
+decisión: con ε=1 acierta 73.1 %, frente a 63.8 % (promedio) del output shield. La diferencia
+frente al **input shield** es de otro orden: con ε_in=1, `b=150` sobre un rango de 10
+(`b/rango=15`) destruye las features en una consulta. Esto no invalida ninguno de los enfoques:
+protegen objetos distintos (resultado vs. contenido de la consulta vs. probabilidad publicada), y los
+ε nominales tampoco son equiparables (ε_in es un presupuesto por registro repartido entre 15
+features; ε_out cubre una probabilidad con Δ=1; RR cubre una etiqueta binaria). La tabla compara
+utilidad a igual parámetro, no igual garantía frente a un mismo adversario.
+
+**Hallazgo sobre la auditoría.** Los controles del baseline se comportan como se espera (sin ruido
+= techo; error inyectado → `VIOLACIÓN` en los 4 ε; mecanismo correcto → compatible) y el ε_LB
+coincide con el esperado a partir de los conteos teóricos (`eps_lb_esperado`), de modo que el
+instrumento está calibrado. Pero la expectativa de que el baseline quede *visiblemente* más ajustado
+que las capas del wrapper **no se cumple frente al output shield**: ambos alcanzan exactamente el
+cociente e^ε con vecinos extremos y el ajuste (ε_LB/ε ≈ 0.66–0.90) lo fija el tamaño de muestra, no
+el mecanismo. Solo la capa de entrada queda lejos, y por la razón opuesta: su ε por feature
+(ε_in/15 ≤ 0.2 en este barrido) está por debajo de lo que T=2000 puede resolver.
 
 ## Qué NO valida
 

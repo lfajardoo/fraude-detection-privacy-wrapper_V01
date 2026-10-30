@@ -5,6 +5,9 @@ Uso (desde privacy-api/):
     python -m validacion.run_validacion --nivel todos --T 2000 --alpha 0.01 \\
         --seed 1 --feature V4 --out results/validacion/
 
+Con --baseline se añade la respuesta aleatorizada (diffprivlib) como punto de
+comparación externo: auditoría con los mismos controles y tabla de utilidad.
+
 Una ruta --out relativa se interpreta respecto a la raíz del repositorio.
 Código de salida: 0 si todo es compatible y los controles se comportan como se
 espera; 1 si hay VIOLACIÓN o un control falla (hallazgo, no se ajusta el test).
@@ -118,6 +121,21 @@ def _tabla(filas: List[Dict]) -> str:
     return "\n".join("  ".join(c.ljust(w) for c, w in zip(r, anchos)) for r in rows)
 
 
+def _tabla_comparacion(filas: List[Dict]) -> str:
+    cab = ["eps", "rr_acierto", "out_acierto", "out_peor_p", "in_b/rango",
+           "rr_eps_lb", "out_eps_lb", "in_eps_lb", "rr_ajuste", "out_ajuste"]
+    rows = [cab]
+    for f in filas:
+        rows.append([
+            f"{f['epsilon']:g}", f"{f['rr_prob_acierto']:.3f}", f"{f['wrapper_out_prob_acierto']:.3f}",
+            f"{f['wrapper_out_prob_acierto_peor_p']:.3f}", f"{f['wrapper_in_b_relativo']:.3g}",
+            f"{f['rr_eps_lb']:.3f}", f"{f['wrapper_eps_lb']:.3f}", f"{f['wrapper_in_eps_lb']:.3f}",
+            f"{f['rr_ajuste']:.2f}", f"{f['wrapper_ajuste']:.2f}",
+        ])
+    anchos = [max(len(r[i]) for r in rows) for i in range(len(cab))]
+    return "\n".join("  ".join(c.ljust(w) for c, w in zip(r, anchos)) for r in rows)
+
+
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
@@ -138,6 +156,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="barrido de ε_in total, separado por comas")
     p.add_argument("--eps-out", type=_lista, default=list(distinguibilidad.BARRIDO_EPS_OUT),
                    help="barrido de ε_out, separado por comas")
+    p.add_argument("--baseline", action="store_true",
+                   help="incluye la respuesta aleatorizada (diffprivlib) como baseline externo")
+    p.add_argument("--eps-rr", type=_lista, default=None,
+                   help="barrido de ε del baseline, separado por comas (defecto 0.5,1,2,3)")
     p.add_argument("--e2e-url", default=None,
                    help="opcional: URL de privacy-api (mode=legacy) para una corrida extremo a extremo")
     p.add_argument("--e2e-eps-in", type=float, default=45.0)
@@ -153,6 +175,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     inicio = time.perf_counter()
     exit_code = 0
+    n3 = None
     meta = {"T": args.T, "alpha": args.alpha, "seed": args.seed, "feature": args.feature}
 
     if args.nivel in ("2", "todos"):
@@ -188,6 +211,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for f in fallos:
             print(f"[HALLAZGO] control {f['tipo']} ({f['capa']}, eps={f['eps_param']}): {f['control_detalle']}")
         if violaciones or fallos:
+            exit_code = 1
+
+    if args.baseline:
+        from . import baseline_rr  # import perezoso: diffprivlib solo se exige con --baseline
+
+        eps_rr = args.eps_rr or list(baseline_rr.BARRIDO_EPS_RR)
+        rr = baseline_rr.ejecutar_auditoria_rr(args.T, args.alpha, args.seed, eps_rr)
+        comp = baseline_rr.comparacion_utilidad(eps_rr, args.T, args.alpha, args.seed, rr["filas"])
+        _escribir_json(out / "baseline_rr.json", {**meta, **rr, "comparacion": comp})
+        _escribir_csv(out / "baseline_rr.csv", rr["filas"])
+        baseline_rr.escribir_comparacion_csv(out / "baseline_comparacion.csv", comp)
+        print(f"\n== Baseline: respuesta aleatorizada (T={args.T}, alpha={args.alpha}, "
+              f"techo eps_lb={rr['techo']:.3f}) ==")
+        print(_tabla(rr["filas"]))
+        print("\n== Comparación a igual epsilon nominal (utilidad y fuga medida) ==")
+        print(_tabla_comparacion(comp))
+        barrido_rr = [f for f in rr["filas"] if f["tipo"] == "barrido"]
+        print(f"\nCalibración: ε_LB/ε del baseline = "
+              f"{min(map(baseline_rr.ajuste, barrido_rr)):.2f}–{max(map(baseline_rr.ajuste, barrido_rr)):.2f}")
+        if n3 is not None:
+            for capa in ("salida", "entrada"):
+                af = [baseline_rr.ajuste(f) for f in n3["filas"]
+                      if f["capa"] == capa and f["tipo"] == "barrido"]
+                print(f"             ε_LB/ε capa de {capa} del wrapper = {min(af):.2f}–{max(af):.2f}")
+        rr_viol = [f for f in barrido_rr if f["veredicto"] == distinguibilidad.VIOLACION]
+        rr_fallos = [f for f in rr["filas"] if f.get("control_ok") is False]
+        if rr_viol:
+            print(f"[HALLAZGO] {len(rr_viol)} auditoría(s) del baseline con VIOLACIÓN.")
+        for f in rr_fallos:
+            print(f"[HALLAZGO] control {f['tipo']} (baseline, eps={f['eps_param']}): {f['control_detalle']}")
+        if rr_viol or rr_fallos:
             exit_code = 1
 
     print(f"\nResultados en {out} ({time.perf_counter() - inicio:.1f} s)")
