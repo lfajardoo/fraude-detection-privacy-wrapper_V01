@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=7.4
+httpx>=0.25      # lo exige starlette.testclient en tests.py
+scipy>=1.11      # Clopper-Pearson, KS, binomtest
